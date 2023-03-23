@@ -20,7 +20,7 @@ The shellcode runner can of course also be useful for other scenarios, apart fro
 6. **Problem: Parent process makes Beacon process look suspicious**. When using the CreateProcess API, by default, the resulting process will spawn as a child of the caller. In many cases, e.g. if your initial code executes in MS Office or other unusual process, this is highly undesirable because it would raise high severity alerts or be blocked immediately.  
 **Solution:** "PPID spoofing" allows the caller to change the parent process ID for the spawned process.  So if our initial code was running in msword.exe or powershell.exe, we can spawn processes as children of a different process, such as msedge.exe.  This will cause applications such as Sysmon to log the process creation under the spoofed parent. We achieve that by passing the additional `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` attribute to the `CreateProcess` call. 
 
-## DinvokeNtMapViewOfSection
+## DinvokeNtMapViewOfSection (under construction)
 In some aspects this shellcode runner is similar to the above `DInvokeOrdinalsQueueUserApc` but instead of Win32 APIs we use the `Nt*`Section set of lower-level native APIs. We fetch the shellcode and create a new section within our current process, then map the view of that section into memory of the current process. Next we get a handle to the target process and map the same section into it. Finally we create a new remote thread to execute the shellcode in the remote process.
 
 
