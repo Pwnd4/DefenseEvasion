@@ -21,16 +21,12 @@ The shellcode runner can of course also be useful for other scenarios, apart fro
 **Solution:** "PPID spoofing" allows the caller to change the parent process ID for the spawned process.  So if our initial code was running in msword.exe or powershell.exe, we can spawn processes as children of a different process, such as msedge.exe.  This will cause applications such as Sysmon to log the process creation under the spoofed parent. We achieve that by passing the additional `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` attribute to the `CreateProcess` call. 
 
 ## DinvokeNtMapViewOfSection
-In some aspects this shellcode runner is similar to the above `DInvokeOrdinalsQueueUserApc` but 
-1. instead of Win32 APIs we use the `Nt*`Section set of lower-level native APIs. We fetch the shellcode and create a new section within our current process, then map the view of that section into memory of the current process. Next we get a handle to the target process and map the same section into it. Finally we create a new remote thread to execute the shellcode in the remote process.
-2. We don't create a new process to inject into but instead find an already running process suitable for our purposes and inject into it.
+In some aspects this shellcode runner is similar to the above `DInvokeOrdinalsQueueUserApc` but instead of Win32 APIs we use the `Nt*`Section set of lower-level native APIs. We fetch the shellcode and create a new section within our current process, then map the view of that section into memory of the current process. Next we get a handle to the target process and map the same section into it. Finally we create a new remote thread to execute the shellcode in the remote process.
+
 
 #### OPSEC Problems and Solutions addressed in this shellcode runner:
-1. **Problem: Suspicious `P/Invoke` usage**. See DInvokeOrdinalsQueueUserApc above.  
-**Solution:** Use Dynamic Invoke as a replacement for P/Invoke. See DInvokeOrdinalsQueueUserApc above.
-2. **Problem: Using Win32 APIs generally under close surveillance**. Using Win32 APIs could be subject to increased monitoring by defense mechanisms, even when avoiding the "usual suspects" like `CreateRemoteThread`.  
+1. **Problem: Using Win32 APIs generally under close surveillance**. Using Win32 APIs could be subject to increased monitoring by defense mechanisms, even when avoiding the "usual suspects" like `CreateRemoteThread`.  
 **Solution:** Using low-level native APIs instead of Win32 APIs can lower our profile. We fetch the shellcode and create a new section within our current process with `NtCreateSection`, then map the view of that section into the memory of the current process as RW with `NtMapViewOfSection` and copy the shellcode into the memory of our own process. Next we get a handle to the target process and map the same section into it, again using `NtMapViewOfSection` but this time setting RX privileges. Finally we create a new remote thread with `NtCreateThreadEx` to execute the shellcode in the remote process.
-3. **Problem: No/limited access to Win32 APIs from JSript/VBA/VBS**. We have to execute from code which has no or very resticted access to Win32 or native APIs (JScript, VBA). See `DInvokeOrdinalsQueueUserApc` above.  
+2. **Problem: No/limited access to Win32 APIs from JSript/VBA/VBS**. We have to execute from code which has no or very resticted access to Win32 or native APIs (JScript, VBA). See `DInvokeOrdinalsQueueUserApc` above.  
 **Solution:** Keep the C# code compatible with [GadgetToJScript](https://github.com/med0x2e/GadgetToJScript). See `DInvokeOrdinalsQueueUserApc` above.  
-4. **Problem: Office applications can not spawn child processes**. The ASR rule *"Block all Office applications from creating child processes"* forbids us to spawn as a child of the caller when executing from MS Office.  
-**Solution:** As we inject into an existing remote process instead of creating a new one, the new thread running our shellcode will appear to be completely unrelated to the MS Office process it originated from. Please note that when injecting into an existing process instead of creating a new one, we can neither spoof the PPID nor use the "Process Mitigation Policy" (to block DLLs) as both settings have to made at the time the process is created (AFAIK).
+3. Spoof the PPID and use the "Process Mitigation Policy" (to block DLLs) (see above).
